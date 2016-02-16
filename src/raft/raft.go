@@ -20,8 +20,8 @@ package raft
 import "sync"
 import "labrpc"
 
-// import "bytes"
-// import "encoding/gob"
+import "bytes"
+import "encoding/gob"
 import "time"
 import "math/rand"
 
@@ -99,12 +99,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here.
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -113,10 +114,12 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here.
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.voteFor)
+	d.Decode(&rf.log)
+	// DPrintf("readPersist: %v", rf)
 }
 
 
@@ -161,6 +164,7 @@ func (rf *Raft) checkTermIsOld(term int) bool {
 		DPrintf("checkTermIsOld: me: %d, old term cur %d, new %d", rf.me, rf.currentTerm, term)
 		rf.currentTerm = term
 		rf.voteFor = -1
+		rf.persist()
 		rf.state = FOLLOWER
 		rf.resetElecTimer()
 		return true
@@ -203,6 +207,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.voteFor < 0 || rf.voteFor == args.CandidateId {
 		rf.voteFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		rf.resetElecTimer()
 	}
@@ -250,6 +255,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	for ; idx < len(args.Entries); idx ++ {
 		rf.log = append(rf.log, args.Entries[idx])
 	}
+	rf.persist()
 	lastNewEntry := args.PrevLogIndex + len(args.Entries)
 
 	// 4
@@ -287,31 +293,6 @@ func (rf *Raft) resetElecTimer() {
 	}
 }
 
-func (rf *Raft) broadcastHeartbeat() {
-
-	for idx := range rf.peers {
-		if idx == rf.me {
-			continue
-		}
-		args := AppendEntriesArgs {
-			Term: rf.currentTerm,
-			LeaderId: rf.me,
-			// TODO
-			LeaderCommit: rf.commitIndex,
-			PrevLogIndex: rf.nextIndex[idx] - 1,
-			PrevLogTerm: rf.getPrevLogTerm(idx),
-		}
-		go func(s int, args AppendEntriesArgs) {
-			var reply AppendEntriesReply
-			if rf.peers[s].Call("Raft.AppendEntries", args, &reply) {
-				rf.mu.Lock()
-				rf.checkTermIsOld(reply.Term)
-				rf.mu.Unlock()
-			}
-		}(idx, args)
-	}
-}
-
 func (rf *Raft) commit(n int) {
 	rf.commitIndex = n
 	for rf.lastApplied < rf.commitIndex {
@@ -332,6 +313,79 @@ func (rf *Raft) getPrevLogTerm(s int) int {
 		prevLogTerm = rf.log[rf.nextIndex[s] - 2].Term
 	}
 	return prevLogTerm
+}
+
+func (rf *Raft) broadcastHeartbeat() {
+
+	for idx := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+		go rf.sendLog(idx)
+	}
+}
+
+func (rf *Raft) sendLog(s int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+retry:
+	if rf.state != LEADER { return }
+	if rf.nextIndex[s] - 1 > len(rf.log) { return }
+	args := AppendEntriesArgs {
+		Term: rf.currentTerm,
+		LeaderId: rf.me,
+		Entries: rf.log[rf.nextIndex[s] - 1:],
+		LeaderCommit: rf.commitIndex,
+		PrevLogIndex: rf.nextIndex[s] - 1,
+		PrevLogTerm: rf.getPrevLogTerm(s),
+	}
+	newNextIndex := len(rf.log) + 1
+
+	if len(args.Entries) > 0 {
+		DPrintf("Start: me %d, sending %v to %d", rf.me, args.Entries, s)
+	}
+	var reply AppendEntriesReply
+
+	rf.mu.Unlock()
+	ok := rf.peers[s].Call("Raft.AppendEntries", args, &reply)
+	rf.mu.Lock()
+
+	if ok {
+		// XXX old reply?
+		if reply.Term < rf.currentTerm || rf.checkTermIsOld(reply.Term) {
+			DPrintf("me: %d, old reply, rpc from %d", rf.me, s)
+			return
+		}
+		if reply.Success {
+			// DPrintf("me: %d, AppendEntries rpc to %d ok, old nextIndex %d, entries %v, log %v", rf.me, s,
+			// rf.nextIndex[s], args.Entries, rf.log)
+			// XXX
+			rf.nextIndex[s] = newNextIndex
+			rf.matchIndex[s] = rf.nextIndex[s] - 1
+			// DPrintf("me: %d, AppendEntries nI %d, mI %d", rf.me, rf.nextIndex[s], rf.matchIndex[s])
+			for n := len(rf.log); n > rf.commitIndex ; n-- {
+				if rf.log[n - 1].Term == rf.currentTerm {
+					DPrintf("me: %d, n %d, mIs %v", rf.me, n, rf.matchIndex)
+					nlarger := 0
+					for i := 0; i < len(rf.peers); i++ {
+						if rf.matchIndex[i] >= n {
+							nlarger ++
+						}
+					}
+					if nlarger > len(rf.peers) / 2 {
+						rf.commit(n)
+						break
+					}
+				}
+			}
+		} else {
+			// TODO
+			DPrintf("me: %d, AppendEntries rpc to %d failed", rf.me, s)
+			rf.nextIndex[s] --
+			goto retry
+		}
+	}
 }
 
 //
@@ -363,6 +417,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	};
 	rf.log = append(rf.log, entry)
+	rf.persist()
 	rf.nextIndex[rf.me] ++
 	rf.matchIndex[rf.me] = len(rf.log)
 
@@ -373,67 +428,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if s == rf.me {
 			continue
 		}
-		go func(s int) {
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
-		retry:
-			if rf.state != LEADER { return }
-			if rf.nextIndex[s] - 1 >= len(rf.log) { return }
-			args := AppendEntriesArgs {
-				Term: term,
-				LeaderId: rf.me,
-				Entries: rf.log[rf.nextIndex[s] - 1:],
-				LeaderCommit: rf.commitIndex,
-				PrevLogIndex: rf.nextIndex[s] - 1,
-				PrevLogTerm: rf.getPrevLogTerm(s),
-				// TODO
-			}
-			newNextIndex := len(rf.log) + 1
-
-			DPrintf("Start: me %d, sending %v to %d", rf.me, args.Entries, s)
-			var reply AppendEntriesReply
-
-			rf.mu.Unlock()
-			ok := rf.peers[s].Call("Raft.AppendEntries", args, &reply)
-			rf.mu.Lock()
-
-			if ok {
-				// XXX old reply?
-				if reply.Term < rf.currentTerm || rf.checkTermIsOld(reply.Term) {
-					DPrintf("me: %d, old reply, rpc from %d", rf.me, s)
-					return
-				}
-				if reply.Success {
-					DPrintf("me: %d, AppendEntries rpc to %d ok, old nextIndex %d, entries %v, log %v", rf.me, s,
-						rf.nextIndex[s], args.Entries, rf.log)
-					// XXX
-					rf.nextIndex[s] = newNextIndex
-					rf.matchIndex[s] = rf.nextIndex[s] - 1
-					DPrintf("me: %d, AppendEntries nI %d, mI %d", rf.me, rf.nextIndex[s], rf.matchIndex[s])
-					for n := len(rf.log); n > rf.commitIndex ; n-- {
-						if rf.log[n - 1].Term == rf.currentTerm {
-							DPrintf("me: %d, n %d, mIs %v", rf.me, n, rf.matchIndex)
-							nlarger := 0
-							for i := 0; i < len(rf.peers); i++ {
-								if rf.matchIndex[i] >= n {
-									nlarger ++
-								}
-							}
-							if nlarger > len(rf.peers) / 2 {
-								rf.commit(n)
-								break
-							}
-						}
-					}
-				} else {
-					// TODO
-					DPrintf("me: %d, AppendEntries rpc to %d failed", rf.me, s)
-					rf.nextIndex[s] --
-					goto retry
-				}
-			}
-		}(s)
+		go rf.sendLog(s)
 	}
 	DPrintf("Start: return %d %d %v", index, term, isLeader)
 
@@ -490,6 +485,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.state = CANDIDATE
 					rf.currentTerm ++
 					rf.voteFor = me
+					rf.persist()
 					lastLogTerm := -1
 					if len(rf.log) > 0 {
 						lastLogTerm = rf.log[len(rf.log) - 1].Term
