@@ -20,6 +20,7 @@ package raft
 import "sync"
 import "labrpc"
 
+// import "fmt"
 import "bytes"
 import "encoding/gob"
 import "time"
@@ -227,9 +228,9 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 	rf.resetElecTimer()
-	if len(args.Entries) > 0 {
-		DPrintf("AppendEntries me: %d, %v", rf.me, args)
-	}
+	// if len(args.Entries) > 0 {
+	// 	DPrintf("AppendEntries me: %d, %v", rf.me, args)
+	// }
 	// 2
 	if args.PrevLogIndex > 0 {
 		if args.PrevLogIndex - 1 >= len(rf.log) {
@@ -331,20 +332,26 @@ func (rf *Raft) sendLog(s int) {
 
 retry:
 	if rf.state != LEADER { return }
-	if rf.nextIndex[s] - 1 > len(rf.log) { return }
+	prevLogIndex := rf.nextIndex[s] - 1
+	if prevLogIndex > len(rf.log) { return }
+
+	// entries := make([]LogEntry, 0)
+	// if prevLogIndex < len(rf.log) {
+	// }
+	entries := rf.log[prevLogIndex:]
 	args := AppendEntriesArgs {
 		Term: rf.currentTerm,
 		LeaderId: rf.me,
-		Entries: rf.log[rf.nextIndex[s] - 1:],
+		Entries: entries,
 		LeaderCommit: rf.commitIndex,
-		PrevLogIndex: rf.nextIndex[s] - 1,
+		PrevLogIndex: prevLogIndex,
 		PrevLogTerm: rf.getPrevLogTerm(s),
 	}
 	newNextIndex := len(rf.log) + 1
 
-	if len(args.Entries) > 0 {
-		DPrintf("Start: me %d, sending %v to %d", rf.me, args.Entries, s)
-	}
+	// if len(args.Entries) > 0 {
+	// 	DPrintf("Start: me %d, sending %v to %d", rf.me, args.Entries, s)
+	// }
 	var reply AppendEntriesReply
 
 	rf.mu.Unlock()
@@ -382,7 +389,9 @@ retry:
 		} else {
 			// TODO
 			DPrintf("me: %d, AppendEntries rpc to %d failed", rf.me, s)
-			rf.nextIndex[s] --
+			if rf.nextIndex[s] > 1 {
+				rf.nextIndex[s] --
+			}
 			goto retry
 		}
 	}
