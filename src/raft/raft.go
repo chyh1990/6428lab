@@ -242,7 +242,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 			break
 		}
 		if args.Entries[idx].Term != rf.log[log_idx].Term {
-			DPrintf("Removing log [%d:]", log_idx)
+			DPrintf("me %d, Removing log %v", rf.me, rf.log[log_idx:])
 			rf.log = rf.log[:log_idx]
 			break
 		}
@@ -250,12 +250,14 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	for ; idx < len(args.Entries); idx ++ {
 		rf.log = append(rf.log, args.Entries[idx])
 	}
+	lastNewEntry := args.PrevLogIndex + len(args.Entries)
 
 	// 4
 	if args.LeaderCommit > rf.commitIndex {
 		// XXX check?
 		n := args.LeaderCommit
-		if n > len(rf.log) { n = len(rf.log) }
+		if n > lastNewEntry { n = lastNewEntry }
+		DPrintf("me %d, commit to %d, LeaderCommit %d, ci %d, %v", rf.me, n, args.LeaderCommit, rf.commitIndex, args)
 		rf.commit(n)
 	}
 	reply.Success = true
@@ -362,7 +364,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	};
 	rf.log = append(rf.log, entry)
 	rf.nextIndex[rf.me] ++
-	rf.matchIndex[rf.me] ++
+	rf.matchIndex[rf.me] = len(rf.log)
 
 	term = rf.currentTerm
 	index = len(rf.log)
@@ -377,6 +379,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		retry:
 			if rf.state != LEADER { return }
+			if rf.nextIndex[s] - 1 >= len(rf.log) { return }
 			args := AppendEntriesArgs {
 				Term: term,
 				LeaderId: rf.me,
@@ -386,8 +389,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				PrevLogTerm: rf.getPrevLogTerm(s),
 				// TODO
 			}
+			newNextIndex := len(rf.log) + 1
 
-			DPrintf("Start: me %d, sending %d logs to %d", rf.me, len(args.Entries), s)
+			DPrintf("Start: me %d, sending %v to %d", rf.me, args.Entries, s)
 			var reply AppendEntriesReply
 
 			rf.mu.Unlock()
@@ -397,13 +401,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			if ok {
 				// XXX old reply?
 				if reply.Term < rf.currentTerm || rf.checkTermIsOld(reply.Term) {
+					DPrintf("me: %d, old reply, rpc from %d", rf.me, s)
 					return
 				}
 				if reply.Success {
-					rf.nextIndex[s] += len(args.Entries)
-					rf.matchIndex[s] = rf.nextIndex[s]
+					DPrintf("me: %d, AppendEntries rpc to %d ok, old nextIndex %d, entries %v, log %v", rf.me, s,
+						rf.nextIndex[s], args.Entries, rf.log)
+					// XXX
+					rf.nextIndex[s] = newNextIndex
+					rf.matchIndex[s] = rf.nextIndex[s] - 1
+					DPrintf("me: %d, AppendEntries nI %d, mI %d", rf.me, rf.nextIndex[s], rf.matchIndex[s])
 					for n := len(rf.log); n > rf.commitIndex ; n-- {
 						if rf.log[n - 1].Term == rf.currentTerm {
+							DPrintf("me: %d, n %d, mIs %v", rf.me, n, rf.matchIndex)
 							nlarger := 0
 							for i := 0; i < len(rf.peers); i++ {
 								if rf.matchIndex[i] >= n {
