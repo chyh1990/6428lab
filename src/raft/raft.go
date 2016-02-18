@@ -22,6 +22,7 @@ import "labrpc"
 
 // import "fmt"
 import "bytes"
+import "sync/atomic"
 import "encoding/gob"
 import "time"
 import "math/rand"
@@ -78,6 +79,7 @@ type Raft struct {
 
 	elec_timer *time.Timer
 	applyCh chan ApplyMsg
+	killed int32
 }
 
 // return currentTerm and whether this server
@@ -145,7 +147,7 @@ type RequestVoteReply struct {
 	Term int
 	VoteGranted bool
 
-	source_id int
+	sourceId int
 }
 
 type AppendEntriesArgs struct {
@@ -251,7 +253,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 			break
 		}
 		if args.Entries[idx].Term != rf.log[log_idx].Term {
-			DPrintf("me %d, Removing log %v", rf.me, rf.log[log_idx:])
+			DPrintf("me %d, Removing log %d logs", rf.me, len(rf.log[log_idx:]))
 			rf.log = rf.log[:log_idx]
 			break
 		}
@@ -357,6 +359,7 @@ retry:
 	// }
 	var reply AppendEntriesReply
 
+	times := 0
 send_again:
 	rf.mu.Unlock()
 	ok := rf.peers[s].Call("Raft.AppendEntries", args, &reply)
@@ -396,10 +399,16 @@ send_again:
 			// DPrintf("me: %d, AppendEntries rpc to %d failed", rf.me, s)
 			if rf.nextIndex[s] > 1 {
 				rf.nextIndex[s] --
+			} else {
+				// panic("XXXXXX nextIndex to small")
+				// peer is not follower any more, do not retry
+				return
 			}
 			goto retry
 		}
 	} else {
+		times ++
+		if times > 5 { return }
 		goto send_again
 	}
 }
@@ -460,9 +469,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	DPrintf("killing %d", rf.me)
+	atomic.StoreInt32(&rf.killed, 1)
 }
 
-func (rf *Raft) startElection() {
+func (rf *Raft) isKilled() bool {
+	return atomic.LoadInt32(&rf.killed) == 0;
+}
+
+func (rf *Raft) startElection() bool {
 	me := rf.me
 	rf.state = CANDIDATE
 	rf.currentTerm ++
@@ -492,13 +507,13 @@ func (rf *Raft) startElection() {
 			if !rf.sendRequestVote(s, req, &reply) {
 				times ++
 				if times > 5 {
-					DPrintf("XX me: %d send to %d failed", rf.me, s)
+					// DPrintf("XX me: %d send to %d failed", rf.me, s)
 					return
 				} else {
 					goto retry
 				}
 			}
-			reply.source_id = s
+			reply.sourceId = s
 			replies <- reply
 		}(idx)
 	}
@@ -514,7 +529,7 @@ func (rf *Raft) startElection() {
 		case reply := <- replies:
 			rf.mu.Lock()
 			DPrintf("me: %d, reply: %v", rf.me, reply)
-			idx := reply.source_id
+			idx := reply.sourceId
 			if rf.checkTermIsOld(reply.Term) {
 				oldTerm = true
 			} else {
@@ -543,6 +558,8 @@ func (rf *Raft) startElection() {
 			break
 		}
 	}
+
+	return hasTimeout
 }
 
 //
@@ -575,7 +592,7 @@ persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf.readPersist(persister.ReadRaftState())
 
 	go func() {
-		for {
+		for rf.isKilled() {
 			select {
 			case <-rf.elec_timer.C:
 				rf.mu.Lock()
@@ -589,13 +606,13 @@ persister *Persister, applyCh chan ApplyMsg) *Raft {
 	}()
 
 	go func() {
-		for {
+		for rf.isKilled() {
 			rf.mu.Lock()
 			if rf.state == LEADER {
 				rf.broadcastHeartbeat()
 			}
 			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(40 * time.Millisecond)
 		}
 		DPrintf("me: %d, stop sending heartbeat", me)
 	}()
